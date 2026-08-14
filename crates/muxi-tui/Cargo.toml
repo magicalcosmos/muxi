@@ -1,0 +1,26 @@
+[package]
+name = "muxi-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+muxi-core = { path = "../muxi-core" }
+muxi-provider = { path = "../muxi-provider" }
+crossterm.workspace = true
+futures.workspace = true
+ratatui.workspace = true
+ropey.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+unicode-segmentation.workspace = true
+unicode-width.workspace = true
+
+[dev-dependencies]
+insta.workspace = true

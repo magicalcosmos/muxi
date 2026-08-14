@@ -1,0 +1,22 @@
+[package]
+name = "muxi-tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+muxi-core = { path = "../muxi-core" }
+blake3.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tempfile = "3.27"
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
