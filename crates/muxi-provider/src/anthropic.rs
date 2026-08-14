@@ -16,9 +16,17 @@ const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_MAX_TOKENS: u64 = 4096;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AnthropicAuthKind {
+    #[default]
+    ApiKey,
+    Bearer,
+}
+
 #[derive(Debug, Clone)]
 pub struct AnthropicConfig {
     pub api_key: SecretString,
+    pub auth_kind: AnthropicAuthKind,
     pub model: String,
     pub base_url: String,
     pub max_tokens: u64,
@@ -34,6 +42,7 @@ impl AnthropicConfig {
     pub fn new(api_key: SecretString, model: impl Into<String>) -> Self {
         Self {
             api_key,
+            auth_kind: AnthropicAuthKind::ApiKey,
             model: model.into(),
             base_url: DEFAULT_BASE_URL.to_owned(),
             max_tokens: DEFAULT_MAX_TOKENS,
@@ -43,6 +52,12 @@ impl AnthropicConfig {
     #[must_use]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
+        self
+    }
+
+    #[must_use]
+    pub fn with_auth_kind(mut self, auth_kind: AnthropicAuthKind) -> Self {
+        self.auth_kind = auth_kind;
         self
     }
 }
@@ -95,10 +110,16 @@ impl Provider for AnthropicProvider {
             ]
         });
 
-        let response = self
+        let request = self
             .client
-            .post(format!("{}/v1/messages", self.config.base_url))
-            .header("x-api-key", self.config.api_key.expose_secret())
+            .post(format!("{}/v1/messages", self.config.base_url));
+        let request = match self.config.auth_kind {
+            AnthropicAuthKind::ApiKey => {
+                request.header("x-api-key", self.config.api_key.expose_secret())
+            }
+            AnthropicAuthKind::Bearer => request.bearer_auth(self.config.api_key.expose_secret()),
+        };
+        let response = request
             .header("anthropic-version", ANTHROPIC_VERSION)
             .json(&body)
             .send()

@@ -98,23 +98,38 @@ muxi [WORKSPACE]
 Muxi 使用找到的第一个配置文件：
 
 1. 当前工作区下的 `muxi.toml`
-2. 全局配置文件
+2. Claude Code 的配置文件，例如 `C:\Users\Administrator\.claude\settings.json`，也就是 `cc switch` 写入的配置
+3. Muxi 自己的全局配置文件
 
 全局配置文件路径：
 
-| 平台 | 路径 |
-|---|---|
-| Windows | `%APPDATA%\.muxi\config.toml` |
-| Linux | `~/.config/.muxi/config.toml` |
-| macOS | 系统配置目录下的 `.muxi/config.toml` |
+| 平台 | 优先路径 | 兼容回退 |
+|---|---|---|
+| Windows | `%USERPROFILE%\.muxi\config.toml` | `%APPDATA%\.muxi\config.toml` |
+| Linux | `~/.muxi/config.toml` | `~/.config/.muxi/config.toml` |
+| macOS | `~/.muxi/config.toml` | 系统配置目录下的 `.muxi/config.toml` |
 
-工作区配置是**整文件覆盖**，不是字段合并。若工作区存在 `muxi.toml`，Muxi 不再读取全局配置；若该文件格式错误，程序会报错退出，而不会回退到全局配置。
+工作区配置是**整文件覆盖**，不是字段合并。若工作区存在 `muxi.toml`，Muxi 不再读取 Claude Code 或全局配置；若该文件格式错误，程序会报错退出，不会回退到后面的配置。
+
+如果没有工作区配置，Muxi 会优先读取 Claude Code 的 `settings.json`：
+
+```json
+{
+  "env": {
+    "ANTHROPIC_AUTH_TOKEN": "PROXY_MANAGED",
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:5000",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-4-6"
+  }
+}
+```
+
+这和 `cc switch` 使用的是同一套配置。读取 Claude Code 配置时，Muxi 会使用 `Authorization: Bearer <ANTHROPIC_AUTH_TOKEN>` 认证，并把 `ANTHROPIC_BASE_URL` 当作 Anthropic-compatible 网关地址。
 
 没有任何配置文件时，Muxi 使用内置 `mock` provider，不访问网络。
 
 ### Anthropic 配置示例
 
-在工作区创建 `muxi.toml`，或创建全局配置 `%APPDATA%\.muxi\config.toml`：
+在工作区创建 `muxi.toml`，或创建 Muxi 全局配置 `%USERPROFILE%\.muxi\config.toml`：
 
 ```toml
 [provider]

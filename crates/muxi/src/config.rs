@@ -4,11 +4,67 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
+use muxi_provider::anthropic::AnthropicAuthKind;
 use secrecy::SecretString;
 use serde::Deserialize;
 
 pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-5";
 const DEFAULT_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
+const CLAUDE_SETTINGS_FILE: &str = ".claude/settings.json";
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum ConfigSource {
+    Muxi(ConfigFile),
+    Claude(ClaudeSettings),
+}
+
+impl ConfigSource {
+    fn into_config_file(self) -> anyhow::Result<ConfigFile> {
+        match self {
+            Self::Muxi(file) => Ok(file),
+            Self::Claude(settings) => settings.into_config_file(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ClaudeSettings {
+    env: ClaudeEnv,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ClaudeEnv {
+    #[serde(rename = "ANTHROPIC_AUTH_TOKEN")]
+    auth_token: String,
+    #[serde(rename = "ANTHROPIC_BASE_URL")]
+    base_url: String,
+    #[serde(rename = "ANTHROPIC_DEFAULT_SONNET_MODEL")]
+    sonnet_model: Option<String>,
+    #[serde(rename = "ANTHROPIC_MODEL")]
+    model: Option<String>,
+}
+
+impl ClaudeSettings {
+    fn into_config_file(self) -> anyhow::Result<ConfigFile> {
+        if self.env.auth_token.trim().is_empty() {
+            bail!("Claude Code settings contain an empty ANTHROPIC_AUTH_TOKEN");
+        }
+        if self.env.base_url.trim().is_empty() {
+            bail!("Claude Code settings contain an empty ANTHROPIC_BASE_URL");
+        }
+        Ok(ConfigFile {
+            provider: ProviderSection {
+                kind: ProviderKind::Anthropic,
+                model: self.env.model.or(self.env.sonnet_model),
+                base_url: Some(self.env.base_url),
+                api_key_env: None,
+                inline_api_key: Some(self.env.auth_token),
+                auth_kind: AnthropicAuthKind::Bearer,
+            },
+        })
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -17,7 +73,7 @@ pub struct ConfigFile {
     pub provider: ProviderSection,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderSection {
     /// `mock` (default) or `anthropic`.
@@ -27,6 +83,25 @@ pub struct ProviderSection {
     pub base_url: Option<String>,
     /// Environment variable holding the API key. Defaults to `ANTHROPIC_API_KEY`.
     pub api_key_env: Option<String>,
+    /// Inline API key/token, used only when importing Claude Code settings.
+    #[serde(skip)]
+    pub inline_api_key: Option<String>,
+    /// HTTP auth style, used only when importing Claude Code settings.
+    #[serde(skip)]
+    pub auth_kind: AnthropicAuthKind,
+}
+
+impl Default for ProviderSection {
+    fn default() -> Self {
+        Self {
+            kind: ProviderKind::Mock,
+            model: None,
+            base_url: None,
+            api_key_env: None,
+            inline_api_key: None,
+            auth_kind: AnthropicAuthKind::ApiKey,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -46,6 +121,7 @@ pub enum ResolvedProvider {
         model: String,
         base_url: String,
         api_key: SecretString,
+        auth_kind: AnthropicAuthKind,
     },
 }
 
@@ -63,7 +139,7 @@ pub struct MissingApiKey {
 /// an anthropic provider is configured without a resolvable API key.
 pub fn load(workspace: &Path) -> anyhow::Result<ResolvedProvider> {
     let candidates = config_candidates(workspace);
-    let file = candidates
+    let source = candidates
         .iter()
         .find_map(|path| read_config(path).transpose())
         .transpose()
@@ -76,26 +152,36 @@ pub fn load(workspace: &Path) -> anyhow::Result<ResolvedProvider> {
             error.context(format!("invalid config in {}", path.display()))
         })?;
 
+    let file = source.map(ConfigSource::into_config_file).transpose()?;
     resolve(file.as_ref())
 }
 
 fn config_candidates(workspace: &Path) -> Vec<PathBuf> {
     let mut candidates = vec![workspace.join("muxi.toml")];
     if let Some(base) = directories::BaseDirs::new() {
+        candidates.push(base.home_dir().join(CLAUDE_SETTINGS_FILE));
+        candidates.push(base.home_dir().join(".muxi").join("config.toml"));
         candidates.push(base.config_dir().join(".muxi").join("config.toml"));
     }
     candidates
 }
 
-fn read_config(path: &Path) -> anyhow::Result<Option<ConfigFile>> {
+fn read_config(path: &Path) -> anyhow::Result<Option<ConfigSource>> {
     if !path.is_file() {
         return Ok(None);
     }
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("cannot read config file {}", path.display()))?;
-    let parsed = toml::from_str::<ConfigFile>(&raw)
-        .with_context(|| format!("cannot parse config file {}", path.display()))?;
-    Ok(Some(parsed))
+    let source = if path.ends_with(CLAUDE_SETTINGS_FILE) {
+        let parsed = serde_json::from_str::<ClaudeSettings>(&raw)
+            .with_context(|| format!("cannot parse config file {}", path.display()))?;
+        ConfigSource::Claude(parsed)
+    } else {
+        let parsed = toml::from_str::<ConfigFile>(&raw)
+            .with_context(|| format!("cannot parse config file {}", path.display()))?;
+        ConfigSource::Muxi(parsed)
+    };
+    Ok(Some(source))
 }
 
 fn resolve(file: Option<&ConfigFile>) -> anyhow::Result<ResolvedProvider> {
@@ -112,14 +198,26 @@ fn resolve_with_env(
     match file.provider.kind {
         ProviderKind::Mock => Ok(ResolvedProvider::Mock),
         ProviderKind::Anthropic => {
-            let env_var = file
+            let api_key = file
                 .provider
-                .api_key_env
+                .inline_api_key
                 .clone()
-                .unwrap_or_else(|| DEFAULT_API_KEY_ENV.to_owned());
-            let Some(api_key) = env(&env_var).filter(|key| !key.is_empty()) else {
-                return Err(MissingApiKey { env_var }.into());
-            };
+                .or_else(|| {
+                    let env_var = file
+                        .provider
+                        .api_key_env
+                        .clone()
+                        .unwrap_or_else(|| DEFAULT_API_KEY_ENV.to_owned());
+                    env(&env_var).filter(|key| !key.is_empty())
+                })
+                .ok_or_else(|| {
+                    let env_var = file
+                        .provider
+                        .api_key_env
+                        .clone()
+                        .unwrap_or_else(|| DEFAULT_API_KEY_ENV.to_owned());
+                    MissingApiKey { env_var }
+                })?;
             let model = file
                 .provider
                 .model
@@ -135,6 +233,7 @@ fn resolve_with_env(
                 model,
                 base_url,
                 api_key: SecretString::from(api_key),
+                auth_kind: file.provider.auth_kind,
             })
         }
     }
@@ -165,6 +264,7 @@ mod tests {
                 model: Some("claude-sonnet-5".to_owned()),
                 base_url: None,
                 api_key_env: Some("MUXI_TEST_ABSENT_KEY".to_owned()),
+                ..ProviderSection::default()
             },
         };
         let error = resolve_with_env(Some(&file), |_| None).expect_err("must require key");
@@ -179,6 +279,7 @@ mod tests {
                 model: None,
                 base_url: None,
                 api_key_env: Some("MUXI_TEST_EMPTY_KEY".to_owned()),
+                ..ProviderSection::default()
             },
         };
         let error = resolve_with_env(Some(&file), |_| Some(String::new()))
@@ -194,6 +295,7 @@ mod tests {
                 model: None,
                 base_url: None,
                 api_key_env: Some("MUXI_TEST_PRESENT_KEY".to_owned()),
+                ..ProviderSection::default()
             },
         };
         let resolved =
@@ -202,6 +304,7 @@ mod tests {
             model,
             base_url,
             api_key: _,
+            auth_kind: _,
         } = &resolved
         else {
             panic!("expected anthropic provider, got {resolved:?}");
@@ -218,6 +321,7 @@ mod tests {
                 model: Some("claude-opus-5".to_owned()),
                 base_url: Some("http://localhost:8080".to_owned()),
                 api_key_env: None,
+                ..ProviderSection::default()
             },
         };
         let resolved =
@@ -241,13 +345,57 @@ model = "claude-opus-5"
     }
 
     #[test]
-    fn global_config_lives_in_dot_muxi_dir() {
+    fn claude_settings_are_first_global_config() {
         let candidates = config_candidates(Path::new("/ws"));
         assert_eq!(candidates[0], Path::new("/ws").join("muxi.toml"));
-        let global = candidates
+        let claude_settings = candidates
             .get(1)
-            .expect("global config candidate requires a home directory");
-        assert!(global.ends_with(".muxi/config.toml"));
+            .expect("Claude Code settings candidate requires a home directory");
+        assert!(claude_settings.ends_with(CLAUDE_SETTINGS_FILE));
+    }
+
+    #[test]
+    fn home_dot_muxi_is_manual_fallback() {
+        let candidates = config_candidates(Path::new("/ws"));
+        let home_global = candidates
+            .get(2)
+            .expect("home config candidate requires a home directory");
+        assert!(home_global.ends_with(".muxi/config.toml"));
+    }
+
+    #[test]
+    fn appdata_dot_muxi_is_legacy_fallback() {
+        let candidates = config_candidates(Path::new("/ws"));
+        let appdata_global = candidates
+            .get(3)
+            .expect("app data config candidate requires a config directory");
+        assert!(appdata_global.ends_with(".muxi/config.toml"));
+    }
+
+    #[test]
+    fn parses_claude_code_settings() {
+        let raw = r#"
+{
+  "env": {
+    "ANTHROPIC_AUTH_TOKEN": "PROXY_MANAGED",
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:5000",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-4-6"
+  }
+}
+"#;
+        let parsed: ClaudeSettings = serde_json::from_str(raw).expect("parse settings");
+        let file = parsed.into_config_file().expect("convert settings");
+        assert_eq!(file.provider.kind, ProviderKind::Anthropic);
+        assert_eq!(file.provider.model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(
+            file.provider.base_url.as_deref(),
+            Some("http://127.0.0.1:5000")
+        );
+        assert_eq!(
+            file.provider.inline_api_key.as_deref(),
+            Some("PROXY_MANAGED")
+        );
+        assert_eq!(file.provider.auth_kind, AnthropicAuthKind::Bearer);
     }
 
     #[test]

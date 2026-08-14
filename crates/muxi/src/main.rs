@@ -47,9 +47,12 @@ fn build_context(resolved: ResolvedProvider) -> TuiContext {
             model,
             base_url,
             api_key,
+            auth_kind,
         } => TuiContext {
             provider: Arc::new(AnthropicProvider::new(
-                AnthropicConfig::new(api_key, model.clone()).with_base_url(base_url),
+                AnthropicConfig::new(api_key, model.clone())
+                    .with_base_url(base_url)
+                    .with_auth_kind(auth_kind),
             )),
             provider_label: "anthropic".to_owned(),
             model,
