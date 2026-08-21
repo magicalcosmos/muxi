@@ -20,50 +20,80 @@ enum ConfigSource {
 }
 
 impl ConfigSource {
-    fn into_config_file(self) -> anyhow::Result<ConfigFile> {
+    fn into_config_file(self) -> anyhow::Result<Option<ConfigFile>> {
         match self {
-            Self::Muxi(file) => Ok(file),
+            Self::Muxi(file) => Ok(Some(file)),
             Self::Claude(settings) => settings.into_config_file(),
         }
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 struct ClaudeSettings {
+    #[serde(default)]
     env: ClaudeEnv,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 struct ClaudeEnv {
     #[serde(rename = "ANTHROPIC_AUTH_TOKEN")]
-    auth_token: String,
+    auth_token: Option<String>,
     #[serde(rename = "ANTHROPIC_BASE_URL")]
-    base_url: String,
+    base_url: Option<String>,
     #[serde(rename = "ANTHROPIC_DEFAULT_SONNET_MODEL")]
     sonnet_model: Option<String>,
+    #[serde(rename = "ANTHROPIC_DEFAULT_OPUS_MODEL")]
+    _opus_model: Option<String>,
+    #[serde(rename = "ANTHROPIC_DEFAULT_HAIKU_MODEL")]
+    _haiku_model: Option<String>,
+    #[serde(rename = "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME")]
+    _sonnet_model_name: Option<String>,
+    #[serde(rename = "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME")]
+    _opus_model_name: Option<String>,
+    #[serde(rename = "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME")]
+    _haiku_model_name: Option<String>,
     #[serde(rename = "ANTHROPIC_MODEL")]
     model: Option<String>,
 }
 
 impl ClaudeSettings {
-    fn into_config_file(self) -> anyhow::Result<ConfigFile> {
-        if self.env.auth_token.trim().is_empty() {
-            bail!("Claude Code settings contain an empty ANTHROPIC_AUTH_TOKEN");
+    fn into_config_file(self) -> anyhow::Result<Option<ConfigFile>> {
+        let auth_token = non_empty(self.env.auth_token);
+        let base_url = non_empty(self.env.base_url);
+        match (auth_token, base_url) {
+            (None, None) => Ok(None),
+            (Some(_), None) => {
+                bail!(
+                    "Claude Code settings contain ANTHROPIC_AUTH_TOKEN without ANTHROPIC_BASE_URL"
+                )
+            }
+            (None, Some(_)) => {
+                bail!(
+                    "Claude Code settings contain ANTHROPIC_BASE_URL without ANTHROPIC_AUTH_TOKEN"
+                )
+            }
+            (Some(auth_token), Some(base_url)) => {
+                let model = non_empty(self.env.model).or_else(|| non_empty(self.env.sonnet_model));
+                Ok(Some(ConfigFile {
+                    provider: ProviderSection {
+                        kind: ProviderKind::Anthropic,
+                        model,
+                        base_url: Some(base_url),
+                        api_key_env: None,
+                        inline_api_key: Some(auth_token),
+                        auth_kind: AnthropicAuthKind::Bearer,
+                    },
+                }))
+            }
         }
-        if self.env.base_url.trim().is_empty() {
-            bail!("Claude Code settings contain an empty ANTHROPIC_BASE_URL");
-        }
-        Ok(ConfigFile {
-            provider: ProviderSection {
-                kind: ProviderKind::Anthropic,
-                model: self.env.model.or(self.env.sonnet_model),
-                base_url: Some(self.env.base_url),
-                api_key_env: None,
-                inline_api_key: Some(self.env.auth_token),
-                auth_kind: AnthropicAuthKind::Bearer,
-            },
-        })
     }
+}
+
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
@@ -139,21 +169,17 @@ pub struct MissingApiKey {
 /// an anthropic provider is configured without a resolvable API key.
 pub fn load(workspace: &Path) -> anyhow::Result<ResolvedProvider> {
     let candidates = config_candidates(workspace);
-    let source = candidates
-        .iter()
-        .find_map(|path| read_config(path).transpose())
-        .transpose()
-        .map_err(|error| {
-            let path = candidates
-                .iter()
-                .find(|path| path.is_file())
-                .cloned()
-                .unwrap_or_else(|| PathBuf::from("muxi.toml"));
-            error.context(format!("invalid config in {}", path.display()))
-        })?;
-
-    let file = source.map(ConfigSource::into_config_file).transpose()?;
-    resolve(file.as_ref())
+    for path in &candidates {
+        let Some(source) =
+            read_config(path).with_context(|| format!("invalid config in {}", path.display()))?
+        else {
+            continue;
+        };
+        if let Some(file) = source.into_config_file()? {
+            return resolve(Some(&file));
+        }
+    }
+    resolve(None)
 }
 
 fn config_candidates(workspace: &Path) -> Vec<PathBuf> {
@@ -384,7 +410,10 @@ model = "claude-opus-5"
 }
 "#;
         let parsed: ClaudeSettings = serde_json::from_str(raw).expect("parse settings");
-        let file = parsed.into_config_file().expect("convert settings");
+        let file = parsed
+            .into_config_file()
+            .expect("convert settings")
+            .expect("applicable settings");
         assert_eq!(file.provider.kind, ProviderKind::Anthropic);
         assert_eq!(file.provider.model.as_deref(), Some("claude-sonnet-4-6"));
         assert_eq!(
@@ -396,6 +425,103 @@ model = "claude-opus-5"
             Some("PROXY_MANAGED")
         );
         assert_eq!(file.provider.auth_kind, AnthropicAuthKind::Bearer);
+    }
+
+    #[test]
+    fn explicit_model_wins_over_all_role_mappings() {
+        let raw = r#"
+{
+  "env": {
+    "ANTHROPIC_AUTH_TOKEN": "PROXY_MANAGED",
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:5000",
+    "ANTHROPIC_MODEL": "claude-opus-4-8",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-4-8",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-4-6",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-haiku-4-5"
+  }
+}
+"#;
+        let parsed: ClaudeSettings = serde_json::from_str(raw).expect("parse settings");
+        let file = parsed
+            .into_config_file()
+            .expect("convert")
+            .expect("applicable");
+        assert_eq!(file.provider.model.as_deref(), Some("claude-opus-4-8"));
+    }
+
+    #[test]
+    fn complete_cc_switch_payload_uses_sonnet_model_not_display_name() {
+        let raw = r#"
+{
+  "permissions": {"allow": []},
+  "env": {
+    "ANTHROPIC_AUTH_TOKEN": "PROXY_MANAGED",
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:5000",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-haiku-4-5",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME": "gpt-5.6",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-4-8",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME": "gpt-5.6",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-4-6",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME": "gpt-5.6"
+  }
+}
+"#;
+        let parsed: ClaudeSettings = serde_json::from_str(raw).expect("parse settings");
+        let file = parsed
+            .into_config_file()
+            .expect("convert")
+            .expect("applicable");
+        assert_eq!(file.provider.model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_ne!(file.provider.model.as_deref(), Some("gpt-5.6"));
+    }
+
+    #[test]
+    fn blank_explicit_model_falls_back_to_sonnet_mapping() {
+        let raw = r#"
+{
+  "env": {
+    "ANTHROPIC_AUTH_TOKEN": "PROXY_MANAGED",
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:5000",
+    "ANTHROPIC_MODEL": "   ",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": " claude-sonnet-4-6 "
+  }
+}
+"#;
+        let parsed: ClaudeSettings = serde_json::from_str(raw).expect("parse settings");
+        let file = parsed
+            .into_config_file()
+            .expect("convert")
+            .expect("applicable");
+        assert_eq!(file.provider.model.as_deref(), Some("claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn ordinary_claude_settings_are_not_a_muxi_provider() {
+        let parsed: ClaudeSettings =
+            serde_json::from_str(r#"{"permissions":{"allow":["Read"]},"env":{"EDITOR":"vim"}}"#)
+                .expect("parse settings");
+        assert!(parsed.into_config_file().expect("convert").is_none());
+    }
+
+    #[test]
+    fn display_names_alone_are_never_request_models() {
+        let parsed: ClaudeSettings =
+            serde_json::from_str(r#"{"env":{"ANTHROPIC_DEFAULT_SONNET_MODEL_NAME":"gpt-5.6"}}"#)
+                .expect("parse settings");
+        assert!(parsed.into_config_file().expect("convert").is_none());
+    }
+
+    #[test]
+    fn partial_cc_switch_settings_are_rejected() {
+        let token_only: ClaudeSettings =
+            serde_json::from_str(r#"{"env":{"ANTHROPIC_AUTH_TOKEN":"PROXY_MANAGED"}}"#)
+                .expect("parse settings");
+        assert!(token_only.into_config_file().is_err());
+
+        let url_only: ClaudeSettings =
+            serde_json::from_str(r#"{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:5000"}}"#)
+                .expect("parse settings");
+        assert!(url_only.into_config_file().is_err());
     }
 
     #[test]

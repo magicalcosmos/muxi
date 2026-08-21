@@ -52,8 +52,10 @@ pub enum StopReason {
     EndTurn,
     ToolUse,
     MaxTokens,
+    StopSequence,
     PauseTurn,
     Refusal,
+    ModelContextWindowExceeded,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,6 +76,12 @@ pub enum ProviderError {
 pub trait Provider: Send + Sync {
     fn capabilities(&self) -> ProviderCapabilities;
 
+    /// Streams one turn into `events`.
+    ///
+    /// Contract: on `Ok(())` the provider must have sent exactly one
+    /// [`ProviderEvent::Finished`] as the last event of the turn; every other
+    /// outcome (transport failure, protocol violation, cancellation) returns
+    /// `Err`. Callers may rely on this to release their busy state.
     async fn stream_turn(
         &self,
         request: ProviderRequest,

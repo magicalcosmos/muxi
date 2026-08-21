@@ -125,6 +125,10 @@ Muxi 使用找到的第一个配置文件：
 
 这和 `cc switch` 使用的是同一套配置。读取 Claude Code 配置时，Muxi 会使用 `Authorization: Bearer <ANTHROPIC_AUTH_TOKEN>` 认证，并把 `ANTHROPIC_BASE_URL` 当作 Anthropic-compatible 网关地址。
 
+模型选择优先级为：非空 `ANTHROPIC_MODEL` → 非空 `ANTHROPIC_DEFAULT_SONNET_MODEL` → Muxi 内置 Sonnet 模型。CC Switch 的 `ANTHROPIC_DEFAULT_OPUS_MODEL`、`ANTHROPIC_DEFAULT_SONNET_MODEL`、`ANTHROPIC_DEFAULT_HAIKU_MODEL` 是并列的角色映射，并不表示当前选中了哪个角色；Muxi 当前默认使用 Sonnet 角色。对应的 `ANTHROPIC_DEFAULT_*_MODEL_NAME` 只用于界面显示，不会作为 API 请求中的模型 ID。
+
+普通 Claude Code `settings.json` 如果没有完整的 `ANTHROPIC_AUTH_TOKEN` 和 `ANTHROPIC_BASE_URL`，Muxi 会继续查找自己的全局配置；只配置其中一项则会报告配置错误。
+
 没有任何配置文件时，Muxi 使用内置 `mock` provider，不访问网络。
 
 ### Anthropic 配置示例
@@ -391,7 +395,7 @@ POST {base_url}/v1/messages
 
 请求包含：
 
-- `x-api-key` 请求头
+- 工作区/全局 Anthropic 配置使用 `x-api-key`；从 CC Switch 配置导入时使用 `Authorization: Bearer`
 - `anthropic-version: 2023-06-01`
 - 配置的模型 ID
 - `stream: true`
@@ -405,6 +409,8 @@ POST {base_url}/v1/messages
 - `message_delta`
 - `message_stop`
 - `error`
+
+SSE 解码支持 LF、CRLF、CR、任意网络 chunk 边界和跨 chunk UTF-8。`message_delta` 记录 Token 用量和 stop reason，只有后续 `message_stop` 才完成本轮；若连接提前结束、事件损坏或 provider 未发送终态，Muxi 会显示失败并恢复为 Idle，已经收到的部分回复会保留。`max_tokens`、`tool_use`、`pause_turn`、`refusal` 和上下文窗口耗尽也会显示对应原因。
 
 HTTP 请求超时固定为 300 秒。
 

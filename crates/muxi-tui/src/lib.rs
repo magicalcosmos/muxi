@@ -11,7 +11,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use muxi_provider::{Provider, ProviderEvent, ProviderRequest};
+use muxi_provider::{Provider, ProviderEvent, ProviderRequest, StopReason};
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
@@ -51,6 +51,7 @@ impl std::fmt::Debug for TuiContext {
 #[derive(Debug)]
 enum Inbox {
     Event(ProviderEvent),
+    Completed(StopReason),
     Failed(String),
 }
 
@@ -160,6 +161,8 @@ struct App {
     message: String,
     response: String,
     phase: Phase,
+    last_stop_reason: Option<StopReason>,
+    last_error: Option<String>,
     input_tokens: u64,
     output_tokens: u64,
     pending_prompt: Option<String>,
@@ -186,6 +189,8 @@ impl App {
             message,
             response: String::new(),
             phase: Phase::Idle,
+            last_stop_reason: None,
+            last_error: None,
             input_tokens: 0,
             output_tokens: 0,
             pending_prompt: None,
@@ -285,6 +290,8 @@ impl App {
         self.pending_prompt = Some(self.input.trim().to_owned());
         self.input.clear();
         self.response.clear();
+        self.last_stop_reason = None;
+        self.last_error = None;
         self.phase = Phase::Busy;
         "Sending…".clone_into(&mut self.message);
     }
@@ -437,7 +444,8 @@ impl App {
             Inbox::Event(
                 ProviderEvent::Started
                 | ProviderEvent::ThinkingDelta(_)
-                | ProviderEvent::ToolCall(_),
+                | ProviderEvent::ToolCall(_)
+                | ProviderEvent::Finished { .. },
             ) => {}
             Inbox::Event(ProviderEvent::TextDelta(delta)) => {
                 self.response.push_str(&delta);
@@ -456,9 +464,29 @@ impl App {
                     self.output_tokens = output_tokens;
                 }
             }
-            Inbox::Event(ProviderEvent::Finished { .. }) => {
+            Inbox::Completed(stop_reason) => {
                 self.phase = Phase::Idle;
-                if self.response.is_empty() {
+                self.last_stop_reason = Some(stop_reason);
+                self.last_error = None;
+                let outcome = match stop_reason {
+                    StopReason::EndTurn | StopReason::StopSequence => None,
+                    StopReason::MaxTokens => {
+                        Some("Response stopped because the output token limit was reached.")
+                    }
+                    StopReason::ToolUse => {
+                        Some("The model requested a tool, but tool execution is not yet handled.")
+                    }
+                    StopReason::PauseTurn => {
+                        Some("The model paused this turn; continuation is required.")
+                    }
+                    StopReason::Refusal => Some("The request was refused by the provider."),
+                    StopReason::ModelContextWindowExceeded => {
+                        Some("Response stopped because the model context window was exhausted.")
+                    }
+                };
+                if let Some(message) = outcome {
+                    message.clone_into(&mut self.message);
+                } else if self.response.is_empty() {
                     "Turn finished with no output.".clone_into(&mut self.message);
                 } else {
                     String::new().clone_into(&mut self.message);
@@ -466,6 +494,8 @@ impl App {
             }
             Inbox::Failed(error) => {
                 self.phase = Phase::Idle;
+                self.last_stop_reason = None;
+                self.last_error = Some(error.clone());
                 self.message = format!("Turn failed: {error}");
             }
         }
@@ -698,35 +728,79 @@ fn spawn_turn(
     let provider = context.provider.clone();
     let model = context.model.clone();
     runtime.spawn(async move {
-        let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(64);
-        let turn = provider.stream_turn(
-            ProviderRequest { model, prompt },
-            events_tx,
-            CancellationToken::new(),
-        );
-        tokio::pin!(turn);
-        loop {
-            tokio::select! {
-                event = events_rx.recv() => {
-                    let Some(event) = event else { break };
-                    if inbox.send(Inbox::Event(event)).is_err() {
-                        break;
-                    }
-                }
-                result = &mut turn => {
-                    if let Err(error) = result {
-                        let _ = inbox.send(Inbox::Failed(error.to_string()));
-                    }
-                    break;
-                }
-            }
-        }
-        while let Ok(event) = events_rx.try_recv() {
-            if inbox.send(Inbox::Event(event)).is_err() {
-                break;
-            }
-        }
+        pump_turn(provider, ProviderRequest { model, prompt }, inbox).await;
     });
+}
+
+/// Owns a provider turn from start through its unique terminal outcome.
+///
+/// Provider events are drained before classifying the result, avoiding the
+/// race where the future and its channel close become ready together. A
+/// provider that returns success without `Finished` is surfaced as a contract
+/// failure rather than leaving the UI busy forever.
+async fn pump_turn(
+    provider: Arc<dyn Provider>,
+    request: ProviderRequest,
+    inbox: std::sync::mpsc::Sender<Inbox>,
+) {
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(64);
+    let turn = provider.stream_turn(request, events_tx, CancellationToken::new());
+    tokio::pin!(turn);
+
+    let mut finished = false;
+    let result = loop {
+        tokio::select! {
+            event = events_rx.recv() => {
+                match event {
+                    Some(event) => {
+                        if forward_turn_event(event, &inbox, &mut finished).is_err() {
+                            return;
+                        }
+                    }
+                    None => break turn.await,
+                }
+            }
+            result = &mut turn => break result,
+        }
+    };
+
+    while let Some(event) = events_rx.recv().await {
+        if forward_turn_event(event, &inbox, &mut finished).is_err() {
+            return;
+        }
+    }
+
+    match result {
+        Ok(()) if !finished => {
+            let _ = inbox.send(Inbox::Failed(
+                "provider turn ended without a terminal event".to_owned(),
+            ));
+        }
+        Err(error) if !finished => {
+            let _ = inbox.send(Inbox::Failed(error.to_string()));
+        }
+        Ok(()) | Err(_) => {
+            // The protocol terminal event owns the UI outcome. A transport
+            // error observed afterwards does not turn a completed response
+            // into a second terminal state.
+        }
+    }
+}
+
+fn forward_turn_event(
+    event: ProviderEvent,
+    inbox: &std::sync::mpsc::Sender<Inbox>,
+    finished: &mut bool,
+) -> Result<(), ()> {
+    if let ProviderEvent::Finished { stop_reason } = event {
+        if *finished {
+            return Ok(());
+        }
+        *finished = true;
+        inbox.send(Inbox::Completed(stop_reason)).map_err(|_| ())
+    } else {
+        inbox.send(Inbox::Event(event)).map_err(|_| ())
+    }
 }
 
 #[cfg(test)]
@@ -809,12 +883,48 @@ mod tests {
             input_tokens: 10,
             output_tokens: 2,
         }));
-        app.on_inbox(Inbox::Event(ProviderEvent::Finished {
-            stop_reason: muxi_provider::StopReason::EndTurn,
-        }));
+        app.on_inbox(Inbox::Completed(StopReason::EndTurn));
         assert_eq!(app.response, "hi there");
         assert_eq!((app.input_tokens, app.output_tokens), (10, 2));
         assert_eq!(app.phase, Phase::Idle);
+        assert_eq!(app.last_stop_reason, Some(StopReason::EndTurn));
+    }
+
+    #[test]
+    fn non_terminal_stop_reasons_explain_the_outcome() {
+        for (reason, expected) in [
+            (StopReason::MaxTokens, "output token limit"),
+            (StopReason::ToolUse, "requested a tool"),
+            (StopReason::PauseTurn, "paused this turn"),
+            (StopReason::Refusal, "refused"),
+            (
+                StopReason::ModelContextWindowExceeded,
+                "context window was exhausted",
+            ),
+        ] {
+            let mut app = App::new(Path::new("."), context());
+            app.phase = Phase::Busy;
+            app.response = "partial".to_owned();
+            app.on_inbox(Inbox::Completed(reason));
+            assert_eq!(app.phase, Phase::Idle);
+            assert!(
+                app.message.contains(expected),
+                "message was: {}",
+                app.message
+            );
+            assert_eq!(app.response, "partial");
+        }
+    }
+
+    #[test]
+    fn new_prompt_clears_previous_outcome() {
+        let mut app = App::new(Path::new("."), context());
+        app.last_stop_reason = Some(StopReason::MaxTokens);
+        app.last_error = Some("old".to_owned());
+        app.input = "next".to_owned();
+        app.take_prompt();
+        assert_eq!(app.last_stop_reason, None);
+        assert_eq!(app.last_error, None);
     }
 
     #[test]
@@ -824,6 +934,104 @@ mod tests {
         app.on_inbox(Inbox::Failed("boom".to_owned()));
         assert_eq!(app.phase, Phase::Idle);
         assert_eq!(app.message, "Turn failed: boom");
+        assert_eq!(app.last_error.as_deref(), Some("boom"));
+    }
+
+    #[derive(Debug)]
+    struct ContractProvider {
+        events: Vec<ProviderEvent>,
+        fail: Option<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for ContractProvider {
+        fn capabilities(&self) -> muxi_provider::ProviderCapabilities {
+            MockProvider::default().capabilities()
+        }
+
+        async fn stream_turn(
+            &self,
+            _request: ProviderRequest,
+            events: tokio::sync::mpsc::Sender<ProviderEvent>,
+            _cancel: CancellationToken,
+        ) -> Result<(), muxi_provider::ProviderError> {
+            for event in self.events.clone() {
+                events
+                    .send(event)
+                    .await
+                    .map_err(|_| muxi_provider::ProviderError::Cancelled)?;
+            }
+            match &self.fail {
+                Some(error) => Err(muxi_provider::ProviderError::Failed(error.clone())),
+                None => Ok(()),
+            }
+        }
+    }
+
+    async fn run_pump(provider: ContractProvider) -> Vec<Inbox> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        pump_turn(
+            Arc::new(provider),
+            ProviderRequest {
+                model: "test".to_owned(),
+                prompt: "hi".to_owned(),
+            },
+            tx,
+        )
+        .await;
+        rx.try_iter().collect()
+    }
+
+    #[tokio::test]
+    async fn successful_provider_without_finished_fails_contract() {
+        let inboxes = run_pump(ContractProvider {
+            events: vec![ProviderEvent::TextDelta("partial".to_owned())],
+            fail: None,
+        })
+        .await;
+        assert!(matches!(
+            inboxes[0],
+            Inbox::Event(ProviderEvent::TextDelta(_))
+        ));
+        assert!(
+            matches!(&inboxes[1], Inbox::Failed(error) if error.contains("without a terminal"))
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_finished_produces_exactly_one_completion() {
+        let inboxes = run_pump(ContractProvider {
+            events: vec![
+                ProviderEvent::TextDelta("done".to_owned()),
+                ProviderEvent::Finished {
+                    stop_reason: StopReason::EndTurn,
+                },
+            ],
+            fail: None,
+        })
+        .await;
+        assert_eq!(
+            inboxes
+                .iter()
+                .filter(|inbox| matches!(inbox, Inbox::Completed(_)))
+                .count(),
+            1
+        );
+        assert!(
+            !inboxes
+                .iter()
+                .any(|inbox| matches!(inbox, Inbox::Failed(_)))
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_error_after_partial_text_is_forwarded() {
+        let inboxes = run_pump(ContractProvider {
+            events: vec![ProviderEvent::TextDelta("partial".to_owned())],
+            fail: Some("upstream 502".to_owned()),
+        })
+        .await;
+        assert!(matches!(&inboxes[1], Inbox::Failed(error) if error.contains("upstream 502")));
     }
 
     fn ctrl_x_key(prefix: bool) -> KeyEvent {

@@ -23,4 +23,5 @@ unicode-segmentation.workspace = true
 unicode-width.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
 insta.workspace = true
