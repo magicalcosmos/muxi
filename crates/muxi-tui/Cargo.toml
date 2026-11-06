@@ -12,10 +12,10 @@ workspace = true
 [dependencies]
 muxi-core = { path = "../muxi-core" }
 muxi-provider = { path = "../muxi-provider" }
+muxi-store = { path = "../muxi-store" }
+muxi-tools = { path = "../muxi-tools" }
 crossterm.workspace = true
-futures.workspace = true
 ratatui.workspace = true
-ropey.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

@@ -20,4 +20,5 @@ thiserror.workspace = true
 tempfile = "3.27"
 time.workspace = true
 tokio.workspace = true
+toml.workspace = true
 tracing.workspace = true

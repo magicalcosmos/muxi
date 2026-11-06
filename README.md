@@ -8,6 +8,7 @@ Muxi 是一个使用 Rust 编写的、以任务为中心的 Vim 模态终端编�
 - Anthropic Messages API 单轮文本流式请求
 - Provider、模型和 Token 用量状态展示
 - 类 Emacs 的 `Ctrl+X f` 文件打开快捷键
+- `Alt+O`（macOS `Cmd+O`）Workspace Sidebar：多 workspace 列表、切换与持久化，添加时通过系统原生目录选择框选择文件夹，文件操作限定在当前 workspace 边界内
 - 带 Vim `relativenumber` 的单文件 UTF-8 文本编辑 Buffer
 - 基础任务状态机、SQLite 事件日志、内容寻址存储与安全文件读取原语
 
@@ -199,17 +200,21 @@ Mock 模式不会访问网络，主要用于开发和测试。默认 mock 没有
 
 ## 界面与状态栏
 
-Muxi 界面主要由以下区域组成：
+Muxi 界面采用深色终端风格，自上而下分为：
 
-1. **Task workspace**：显示 Muxi 标识和当前工作区路径
-2. **Primary buffer**：显示模型回复或当前打开的文件
-3. **状态栏**：显示模式、运行阶段、Provider、模型与 Token 用量
-4. **Composer/Minibuffer**：输入提示、命令或文件路径
+1. **Header**：`✳ Muxi` 标识、模型与 Provider、当前 workspace 路径；有提示/警告时显示 `!! 消息` 行
+2. **Workspace Sidebar**（可选，`Alt+O` 开关）：顶部搜索框（`/` 过滤，无占位文字）、workspace 列表；未选中项为整行底色的卡片（`●` 图标 + 名称 + 目录路径，路径过长以 `…` 截断），选中项不带底色
+3. **聊天区**：用户消息显示为整行反色的 `> 消息` 栏，模型回复显示在下方
+4. **Turn 状态行**：模型运行中显示 `✳ Spinning… (秒数 · ↓ tokens · still thinking)`，结束后显示 `↳ 输入↑ / 输出↓ tokens` 用量
+5. **Composer 输入区**：顶部一条分隔线，`>` 提示符后输入（Command 模式为 `:`，文件提示为 `find file:`，添加 workspace 为 `workspace name:`）
+6. **提示行**：`❯❯ 模式名` + 当前模式可用的按键提示，运行中追加 `· turn running`
+7. **底部工具栏**：左侧功能 pill 按钮（`i compose`、`C-x f file`、`alt+o sidebar`、`:q quit`），右侧显示 workspace 路径与模型 pill
 
-状态栏示例：
+状态栏示例（模型运行中）：
 
 ```text
-INSERT  phase: idle  provider: anthropic  model: claude-sonnet-5  tokens: 120/48
+✳ Spinning… (12s · ↓ 300 tokens · still thinking)
+❯❯ INSERT enter send · shift+enter newline · esc normal · turn running
 ```
 
 模式包括：
@@ -220,6 +225,9 @@ INSERT  phase: idle  provider: anthropic  model: claude-sonnet-5  tokens: 120/48
 | `INSERT` | 输入模型提示或编辑文件 |
 | `COMMAND` | 输入 `:` 命令 |
 | `FILE` | 输入需要打开的文件路径 |
+| `SIDEBAR` | 焦点在左侧 Workspace Sidebar 列表上 |
+| `SEARCH` | Sidebar 搜索框：输入过滤 workspace 列表 |
+| `WORKSPACE` | 输入新 Workspace 的显示名称（`Enter` 后弹出系统目录选择框） |
 
 编辑状态下使用终端原生的闪烁竖线光标；退出程序时会恢复用户原本的终端光标样式。
 
@@ -233,10 +241,49 @@ INSERT  phase: idle  provider: anthropic  model: claude-sonnet-5  tokens: 120/48
 |---|---|
 | `Ctrl+C` | 直接退出 Muxi |
 | `Ctrl+X`，然后按 `f` | 打开文件路径输入框 |
+| `Ctrl+W`，然后按 `w` | 在两个 buffer（主窗口 ↔ Workspace Sidebar）之间切换焦点；Sidebar 隐藏时先打开 |
+| `Alt+O`（macOS `Cmd+O`） | 打开/关闭 Workspace Sidebar |
 
-`Ctrl+X f` 是 Emacs 风格前缀键：先按住 `Ctrl` 按 `X`，松开后再按 `f`，不是三个键同时按。
+`Ctrl+X f` 与 `Ctrl+W w` 是前缀键：先按住修饰键按第一个字母，松开后再按对应字母，不是同时按。前缀后按了其他键会取消前缀，该键仍会被当前焦点窗口处理。
+
+`Alt+O` / `Cmd+O` 是全局快捷键，在任何模式下都生效。多数 macOS 终端不会把 `Cmd` 组合键转发给程序，此时可尝试 `Option+O`；Windows 与 Linux 使用 `Alt+O`。
 
 `Ctrl+C` 当前会退出整个程序，不是取消当前模型请求。
+
+### Workspace Sidebar
+
+按 `Alt+O`、`t t` 或 `Ctrl+W w` 打开 Workspace Sidebar。Sidebar 与主窗口是两个 buffer：`Ctrl+W w` 在两者之间切换焦点（Vim `C-w w` 风格）；`Alt+O` / `t t` 开关侧栏——Sidebar 聚焦时再按 `t t` 同样会关闭它。Sidebar 列出所有已添加的 workspace（显示名称与目录路径），所有模型请求与文件操作只在**当前激活**的 workspace 下进行（Header 与状态栏显示激活路径）。
+
+Sidebar 聚焦时的按键：
+
+| 按键 | 功能 |
+|---|---|
+| `j` / `k`（或方向键） | 上下移动选择 |
+| `t`，然后 `t` | 关闭 Workspace Sidebar（双键开关，等价 `Alt+O`） |
+| `/` | 进入搜索框：输入即过滤列表，方向键选择，`Esc` 清空并返回 |
+| `Enter` | 激活选中的 workspace |
+| `a` | 添加 workspace：先输入显示名称，`Enter` 后弹出系统原生目录选择框选择文件夹（`Esc` 取消） |
+| `d` | 从列表移除选中的 workspace |
+| `Esc` | 退出 Sidebar 焦点（Sidebar 保持显示） |
+| `Alt+O` | 关闭 Sidebar |
+
+添加 workspace 的流程：
+
+1. 按 `Alt+O` 打开 Sidebar，按 `a`
+2. 输入 workspace 的显示名称（显示在 Sidebar 列表中），按 `Enter`
+3. Muxi 暂时挂起终端界面，弹出系统原生目录选择框（Windows 使用 `FolderBrowserDialog`，macOS 使用 `choose folder`，Linux 使用 `zenity`/`kdialog`）
+4. 选择项目目录后，Muxi 恢复界面，Sidebar 中显示刚输入的名称并自动激活该 workspace
+
+规则：
+
+- Workspace 列表持久化在 `SQLite` 数据库 `%USERPROFILE%\.muxi\muxi.db`（Linux/macOS 为 `~/.muxi/muxi.db`），按插入顺序存储 `name` + `path` 条目
+- 旧版 `workspaces.toml`（`[[workspaces]]` 表数组或更早的纯路径列表）会在启动时自动导入数据库，然后改名为 `workspaces.toml.imported` 归档
+- 搜索框按名称或路径的不区分大小写子串过滤；无匹配时 `Enter` 不会激活任何条目
+- 启动时命令行传入的 workspace 会自动加入列表（名称取目录名）并激活
+- 添加时所选路径必须是一个已存在的目录；重复添加相同目录会直接跳转到已有条目
+- 模型请求运行期间（`busy`）锁定 workspace 切换、删除与激活，保证请求只在发起时所在的 workspace 内操作
+- 切换 workspace 时会关闭当前打开的文件 Buffer（旧文件不在新 workspace 边界内）
+- 至少保留一个 workspace，最后一个不可删除
 
 ### Normal 模式：聊天界面
 
@@ -244,7 +291,10 @@ INSERT  phase: idle  provider: anthropic  model: claude-sonnet-5  tokens: 120/48
 |---|---|
 | `i` | 进入 Insert 模式，编辑 Composer |
 | `:` | 进入 Command 模式 |
+| `t`，然后 `t` | 打开/关闭 Workspace Sidebar（Vim 双键风格，等价 `Alt+O`） |
+| `Ctrl+W`，然后 `w` | 主窗口 ↔ Sidebar 切换焦点（Sidebar 隐藏时先打开） |
 | `Ctrl+X f` | 打开文件 |
+| `Alt+O` | 打开/关闭 Workspace Sidebar（进入 Sidebar 聚焦） |
 | `q` | 无操作；退出必须使用 `:q` |
 | `h` / `j` / `k` / `l` | 当前仅显示方向提示，尚未连接到聊天视图导航 |
 
@@ -283,7 +333,7 @@ INSERT  phase: idle  provider: anthropic  model: claude-sonnet-5  tokens: 120/48
 路径可以是：
 
 - 相对于当前 Workspace 的路径，例如 `README.md`
-- 绝对路径
+- 绝对路径，但必须位于当前 Workspace 内，否则会被拒绝（提示 `path escapes workspace`）
 
 只能打开已存在且可按 UTF-8 解码的文本文件。
 
@@ -298,6 +348,9 @@ INSERT  phase: idle  provider: anthropic  model: claude-sonnet-5  tokens: 120/48
 | `i` | 进入文件 Insert 模式 |
 | `:` | 进入 Command 模式 |
 | `Ctrl+X f` | 打开另一个文件并替换当前 Buffer |
+| `t`，然后 `t` | 打开/关闭 Workspace Sidebar |
+| `Ctrl+W`，然后 `w` | 主窗口 ↔ Sidebar 切换焦点 |
+| `Alt+O` | 打开/关闭 Workspace Sidebar |
 
 上下移动时，光标列会被限制在目标行实际长度内。
 
@@ -421,7 +474,7 @@ crates/
 ├── muxi/           # 可执行程序、CLI、配置加载与运行时组装
 ├── muxi-core/      # 任务领域模型、阶段状态机和确定性 reducer
 ├── muxi-provider/  # Provider 接口、MockProvider、Anthropic SSE 适配器
-├── muxi-store/     # SQLite 事件日志和内容寻址存储（CAS）
+├── muxi-store/     # SQLite 存储：事件日志、workspace 持久化、内容寻址存储（CAS）
 ├── muxi-tools/     # Workspace 路径边界、安全文件读取和 BLAKE3 哈希
 └── muxi-tui/       # Ratatui UI、模式输入、模型流式展示和文件编辑器
 ```
@@ -472,10 +525,11 @@ crates/
 包含：
 
 - SQLite 事件追加和 reducer 重放
+- `WorkspaceStore`：Sidebar workspace 列表的 SQLite 持久化（`~/.muxi/muxi.db`），含旧 `workspaces.toml` 导入解析
 - 使用 BLAKE3 内容哈希的 CAS
 - 临时文件后重命名的内容提交方式
 
-目前尚未由主程序打开，程序重启不会恢复 TUI 会话。
+Workspace 列表已由主程序使用；事件日志和 CAS 仍未接入，程序重启不会恢复 TUI 会话。
 
 ### `muxi-tools`
 
@@ -486,7 +540,7 @@ crates/
 - UTF-8/二进制文件读取
 - BLAKE3 内容哈希
 
-当前 TUI 文件 Buffer 尚未接入 `muxi-tools::Workspace`，因此 `Ctrl+X f` 仍可以打开工作区外路径。
+TUI 文件 Buffer 已通过 `muxi-tools::Workspace` 使用安全边界：`Ctrl+X f` 打开的相对路径在当前 Workspace 内解析，绝对路径必须位于当前 Workspace 内。
 
 ## 开发与验证
 
@@ -552,14 +606,14 @@ CI 会在 Windows、Ubuntu 和 macOS 上运行检查。
 - 无未保存状态和关闭确认
 - 打开新文件会替换旧 Buffer
 - 保存会统一用 `\n` 重写文本，不能可靠保留原始 CRLF 和文件末尾换行
-- 文件路径尚未使用 `muxi-tools` 的 Workspace 安全边界
+- Sidebar 列表没有滚动，workspace 数量多时超出部分会被裁剪
 
 ### 任务与存储
 
 - `:task` 仍是占位命令
 - 任务状态机尚未接入 TUI
 - SQLite 事件日志和 CAS 尚未由主程序使用
-- 程序重启后不会恢复消息、打开文件、光标或任务状态
+- 程序重启后 workspace 列表从 `muxi.db` 恢复，但消息、打开文件、光标和任务状态不恢复
 
 ### 0.1 明确不包含
 

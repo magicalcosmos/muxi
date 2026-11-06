@@ -322,7 +322,11 @@ impl SseDecoder {
                         output_tokens: message.usage.output_tokens,
                     }]),
                     StreamMessage::ContentBlockDelta { delta } => match delta {
-                        Delta::TextDelta { text } => Ok(vec![ProviderEvent::TextDelta(text)]),
+                        Delta::Text { text } => Ok(vec![ProviderEvent::TextDelta(text)]),
+                        Delta::Thinking { thinking } => {
+                            Ok(vec![ProviderEvent::ThinkingDelta(thinking)])
+                        }
+                        Delta::Other => Ok(Vec::new()),
                     },
                     StreamMessage::MessageDelta { delta, usage } => {
                         if let Some(reason) = delta.stop_reason.as_deref() {
@@ -445,7 +449,14 @@ struct OutputUsage {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Delta {
-    TextDelta { text: String },
+    #[serde(rename = "text_delta")]
+    Text { text: String },
+    #[serde(rename = "thinking_delta")]
+    Thinking { thinking: String },
+    /// Deltas Muxi does not consume (e.g. `signature_delta`); some
+    /// Anthropic-compatible gateways emit thinking blocks by default.
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Debug, Deserialize)]
@@ -676,6 +687,33 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn decodes_thinking_block_from_gateway_streams() {
+        // GLM-compatible gateways emit a thinking block before the text
+        // block, including signature deltas Muxi does not consume.
+        let events = run_decoder(
+            b"event: message_start\r\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":13,\"output_tokens\":1}}}\r\n\r\n\
+              event: content_block_start\r\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\r\n\r\n\
+              event: content_block_delta\r\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Let me analyze\"}}\r\n\r\n\
+              event: content_block_delta\r\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"abc\"}}\r\n\r\n\
+              event: content_block_stop\r\ndata: {\"type\":\"content_block_stop\",\"index\":0}\r\n\r\n\
+              event: content_block_start\r\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\r\n\r\n\
+              event: content_block_delta\r\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\r\n\r\n\
+              event: content_block_stop\r\ndata: {\"type\":\"content_block_stop\",\"index\":1}\r\n\r\n\
+              event: message_delta\r\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":34}}\r\n\r\n\
+              event: message_stop\r\ndata: {\"type\":\"message_stop\"}\r\n\r\n",
+        )
+        .expect("gateway transcript with thinking must decode");
+        assert!(events.contains(&ProviderEvent::ThinkingDelta("Let me analyze".to_owned())));
+        assert!(events.contains(&ProviderEvent::TextDelta("hello".to_owned())));
+        assert!(matches!(
+            events.last(),
+            Some(ProviderEvent::Finished {
+                stop_reason: StopReason::EndTurn
+            })
+        ));
     }
 
     #[test]

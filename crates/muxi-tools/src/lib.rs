@@ -24,6 +24,22 @@ pub struct FileSnapshot {
     pub hash: Hash,
 }
 
+/// Canonicalizes a path and strips the Windows extended-length prefix
+/// (`\\?\C:\...`), which `std::fs::canonicalize` keeps even for ordinary
+/// paths. The stripped form displays naturally and compares equal to
+/// user-entered paths.
+pub fn canonicalize(path: impl AsRef<Path>) -> std::io::Result<PathBuf> {
+    let canonical = std::fs::canonicalize(path)?;
+    let text = canonical.to_string_lossy();
+    if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+        Ok(PathBuf::from(format!(r"\\{unc}")))
+    } else if let Some(plain) = text.strip_prefix(r"\\?\") {
+        Ok(PathBuf::from(plain))
+    } else {
+        Ok(canonical)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Workspace {
     root: PathBuf,
@@ -31,7 +47,7 @@ pub struct Workspace {
 
 impl Workspace {
     pub fn new(root: impl AsRef<Path>) -> Result<Self, ToolError> {
-        let root = std::fs::canonicalize(root)?;
+        let root = canonicalize(root)?;
         if !root.is_dir() {
             return Err(ToolError::PathEscapesWorkspace(root));
         }
@@ -49,12 +65,12 @@ impl Workspace {
         }
         let candidate = self.root.join(path);
         let existing = if candidate.exists() {
-            std::fs::canonicalize(&candidate)?
+            canonicalize(&candidate)?
         } else {
             let parent = candidate
                 .parent()
                 .ok_or_else(|| ToolError::PathEscapesWorkspace(candidate.clone()))?;
-            std::fs::canonicalize(parent)?.join(
+            canonicalize(parent)?.join(
                 candidate
                     .file_name()
                     .ok_or_else(|| ToolError::PathEscapesWorkspace(candidate.clone()))?,
@@ -108,5 +124,20 @@ mod tests {
             workspace.resolve(".."),
             Err(ToolError::PathEscapesWorkspace(_))
         ));
+    }
+
+    #[test]
+    fn canonicalize_strips_windows_extended_prefix() {
+        let dir = tempdir().expect("temp directory");
+        let stripped = canonicalize(dir.path()).expect("canonicalize");
+        let text = stripped.to_string_lossy();
+        assert!(
+            !text.starts_with(r"\\?\"),
+            "extended-length prefix must be stripped, got: {text}"
+        );
+        assert_eq!(
+            Workspace::new(dir.path()).expect("workspace").root(),
+            stripped
+        );
     }
 }
